@@ -1,0 +1,16 @@
+{
+  "name": "ExternalSignalStrategy",
+  "version": "1.0.0",
+  "description": "Trading strategy that executes based on external AI agent swarm signals from a REST API endpoint",
+  "author": "Custom",
+  "type": "strategy",
+  "requirements": [],
+  "config_files": [
+    "config.json"
+  ],
+  "tentacles": {
+    "strategy_evaluator": "ExternalSignalStrategyEvaluator",
+    "trading_mode": "ExternalSignalTradingMode"
+  }
+}
+
