@@ -15,7 +15,7 @@ Then configure OctoBot with:
     "url": "http://localhost:8000/latest"
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
@@ -28,77 +28,74 @@ app = FastAPI(
 
 
 class Signal(BaseModel):
-    """Trading signal model"""
-    symbol: str = Field(..., description="Trading pair (e.g., 'BTC-USDT')")
+    """Trading signal model for spot trading"""
+    pair: str = Field(..., description="Trading pair (e.g., 'BTC-USDC')")
     timestamp: str = Field(..., description="ISO 8601 timestamp (UTC)")
-    action: str = Field(..., description="One of: 'long', 'short', 'no-trade'")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence level (0.0 to 1.0)")
-    reason: str = Field(..., description="Human-readable reason for the signal")
-    tp_pct: float = Field(..., gt=0.0, description="Take-profit percentage (e.g., 0.01 = 1%)")
-    sl_pct: float = Field(..., gt=0.0, description="Stop-loss percentage (e.g., 0.01 = 1%)")
+    action: str = Field(..., description="One of: 'buy', 'sell', 'no-trade'")
+    bias: float = Field(..., ge=0.0, le=100.0, description="Signal confidence/bias as percentage (0 to 100)")
+    close_time: str = Field(..., description="ISO 8601 timestamp when position should be closed (UTC)")
+    reason: Optional[str] = Field(None, description="Human-readable reason for the signal")
 
 
 # In-memory storage for demo purposes
 # Replace with your actual signal generation logic
 latest_signals = {
-    "BTC-USDT": Signal(
-        symbol="BTC-USDT",
+    "BTC-USDC": Signal(
+        pair="BTC-USDC",
         timestamp=datetime.now(timezone.utc).isoformat(),
-        action="long",
-        confidence=0.75,
-        reason="AI consensus: Strong bullish momentum detected",
-        tp_pct=0.015,
-        sl_pct=0.01
+        action="buy",
+        bias=75.0,
+        close_time=(datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
+        reason="AI consensus: Strong bullish momentum detected"
     )
 }
 
 
 @app.get("/latest", response_model=Signal)
-async def get_latest_signal(symbol: Optional[str] = Query(None, description="Filter by symbol")):
+async def get_latest_signal(pair: Optional[str] = Query(None, description="Filter by pair")):
     """
     Get the latest trading signal.
     
     Args:
-        symbol: Optional symbol filter (e.g., "BTC-USDT")
+        pair: Optional pair filter (e.g., "BTC-USDC")
         
     Returns:
-        Latest signal for the specified symbol or default symbol
+        Latest signal for the specified pair or default pair
     """
-    # If symbol specified, return signal for that symbol
-    if symbol:
-        if symbol in latest_signals:
-            return latest_signals[symbol]
-        # Return a no-trade signal if symbol not found
+    # If pair specified, return signal for that pair
+    if pair:
+        if pair in latest_signals:
+            return latest_signals[pair]
+        # Return a no-trade signal if pair not found
         return Signal(
-            symbol=symbol,
+            pair=pair,
             timestamp=datetime.now(timezone.utc).isoformat(),
             action="no-trade",
-            confidence=0.0,
-            reason=f"No signal available for {symbol}",
-            tp_pct=0.01,
-            sl_pct=0.01
+            bias=0.0,
+            close_time=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            reason=f"No signal available for {pair}"
         )
     
-    # Return default signal (BTC-USDT)
-    default_symbol = "BTC-USDT"
-    if default_symbol in latest_signals:
+    # Return default signal (BTC-USDC)
+    default_pair = "BTC-USDC"
+    if default_pair in latest_signals:
         # Update timestamp to current time
-        signal = latest_signals[default_symbol]
+        signal = latest_signals[default_pair]
         signal.timestamp = datetime.now(timezone.utc).isoformat()
         return signal
     
     # Fallback: generate a new signal
-    return generate_ai_signal(default_symbol)
+    return generate_ai_signal(default_pair)
 
 
-def generate_ai_signal(symbol: str) -> Signal:
+def generate_ai_signal(pair: str) -> Signal:
     """
-    Generate a trading signal using AI Agent Swarm logic.
+    TODO: Generate a trading signal using AI Agent Swarm logic.
     
     REPLACE THIS WITH YOUR ACTUAL AI LOGIC!
     
     Args:
-        symbol: Trading pair to generate signal for
+        pair: Trading pair to generate signal for
         
     Returns:
         Generated trading signal
@@ -109,32 +106,35 @@ def generate_ai_signal(symbol: str) -> Signal:
     import random
     
     # Demo logic: Random signals (replace with real AI!)
-    actions = ["long", "short", "no-trade"]
+    actions = ["buy", "sell", "no-trade"]
     weights = [0.3, 0.2, 0.5]  # Bias towards no-trade for safety
     action = random.choices(actions, weights=weights)[0]
     
     if action == "no-trade":
-        confidence = 0.0
+        bias = 0.0
         reason = "No clear signal from AI agents"
     else:
-        confidence = random.uniform(0.5, 0.9)
-        reason = f"AI consensus: {action.upper()} signal with {confidence:.1%} confidence"
+        bias = random.uniform(50.0, 90.0)
+        reason = f"AI consensus: {action.upper()} signal with {bias:.1f}% bias"
+    
+    # Set close_time to 2-6 hours from now
+    close_hours = random.uniform(2, 6)
+    close_time = datetime.now(timezone.utc) + timedelta(hours=close_hours)
     
     return Signal(
-        symbol=symbol,
+        pair=pair,
         timestamp=datetime.now(timezone.utc).isoformat(),
         action=action,
-        confidence=confidence,
-        reason=reason,
-        tp_pct=random.uniform(0.01, 0.02),  # 1-2% TP
-        sl_pct=random.uniform(0.005, 0.015)  # 0.5-1.5% SL
+        bias=bias,
+        close_time=close_time.isoformat(),
+        reason=reason
     )
 
 
 @app.post("/update")
 async def update_signal(signal: Signal):
     """
-    Update the latest signal for a symbol.
+    Update the latest signal for a pair.
     
     This endpoint allows you to push new signals to the server.
     Useful for integrating with external AI systems.
@@ -145,8 +145,8 @@ async def update_signal(signal: Signal):
     Returns:
         Success message
     """
-    latest_signals[signal.symbol] = signal
-    return {"message": f"Signal updated for {signal.symbol}", "signal": signal}
+    latest_signals[signal.pair] = signal
+    return {"message": f"Signal updated for {signal.pair}", "signal": signal}
 
 
 @app.get("/health")

@@ -20,6 +20,13 @@ External Signal Strategy Evaluator
 This evaluator fetches trading signals from an external REST API endpoint
 and generates trading recommendations based on those signals.
 
+Signal Format (Spot Trading):
+- pair: Trading pair (e.g., "BTC-USDC")
+- action: "buy", "sell", or "no-trade"
+- bias: Confidence percentage (0-100)
+- close_time: ISO timestamp when position should be closed
+- timestamp: ISO timestamp of signal generation
+
 To use this strategy:
 1. Add configuration to your config.json:
    {
@@ -61,10 +68,10 @@ import octobot.utils.signal_client as signal_client
 
 class ExternalSignalStrategyEvaluator(evaluators.StrategyEvaluator):
     """
-    Strategy evaluator that uses external AI agent swarm signals.
+    Strategy evaluator that uses external spot trading signals.
     
     Fetches signals periodically and evaluates them for trading decisions.
-    Supports long, short, and no-trade signals with take-profit and stop-loss levels.
+    Supports buy, sell, and no-trade signals with bias (confidence) and close_time.
     """
     
     def __init__(self):
@@ -153,25 +160,28 @@ class ExternalSignalStrategyEvaluator(evaluators.StrategyEvaluator):
         Process an actionable signal and update the evaluation matrix.
         
         Args:
-            signal: Signal dict with action, symbol, tp_pct, sl_pct, etc.
+            signal: Signal dict with action, pair, bias, close_time, etc.
         """
         action = signal.get("action")
-        symbol = signal.get("symbol")
-        confidence = signal.get("confidence", 0.5)
+        pair = signal.get("pair")
+        bias = signal.get("bias", 50.0)
         
-        # Convert action to eval note
-        if action == "long":
-            eval_note = confidence  # Positive value for long
-        elif action == "short":
-            eval_note = -confidence  # Negative value for short
+        # Convert bias (0-100) to eval note (-1 to 1)
+        # For buy: positive value based on bias
+        # For sell: negative value
+        confidence = bias / 100.0
+        
+        if action == "buy":
+            eval_note = confidence  # Positive value for buy
+        elif action == "sell":
+            eval_note = -confidence  # Negative value for sell
         else:
             eval_note = 0  # Neutral
         
         self.logger.info(
-            f"Processing signal: {action} {symbol} "
-            f"(confidence: {confidence:.2%}, "
-            f"TP: {signal.get('tp_pct', 0):.2%}, "
-            f"SL: {signal.get('sl_pct', 0):.2%})"
+            f"Processing signal: {action} {pair} "
+            f"(bias: {bias:.1f}%, "
+            f"close_time: {signal.get('close_time', 'N/A')})"
         )
         
         # Update evaluation matrix
@@ -185,7 +195,7 @@ class ExternalSignalStrategyEvaluator(evaluators.StrategyEvaluator):
         Implementation of the evaluation logic.
         
         Args:
-            eval_note: Evaluation score (-1 to 1, negative for short, positive for long)
+            eval_note: Evaluation score (-1 to 1, negative for sell, positive for buy)
             signal: Optional signal data for context
         """
         # Store signal data for the trading mode to access
@@ -195,7 +205,7 @@ class ExternalSignalStrategyEvaluator(evaluators.StrategyEvaluator):
             # Set evaluation note
             await self.evaluation_completed(
                 cryptocurrency=self.cryptocurrency,
-                symbol=signal.get("symbol"),
+                symbol=signal.get("pair", "").replace("-", "/"),
                 time_frame=None,
                 eval_note=eval_note,
                 eval_type=evaluator_enums.EvaluatorMatrixTypes.STRATEGIES
@@ -204,7 +214,7 @@ class ExternalSignalStrategyEvaluator(evaluators.StrategyEvaluator):
     def get_signal_data(self) -> Optional[Dict[str, Any]]:
         """
         Get the most recent signal data.
-        Used by the trading mode to access TP/SL levels.
+        Used by the trading mode to access bias and close_time.
         """
         if self.signal_client:
             return self.signal_client.get_cached_signal()

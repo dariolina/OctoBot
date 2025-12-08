@@ -27,10 +27,10 @@ import octobot_commons.logging as logging
 class ExternalSignalClient:
     """
     Client for fetching external trading signals from REST API.
-    Implements caching and validation for AI Agent Swarm signals.
+    Implements caching and validation for spot trading signals.
     """
     
-    VALID_ACTIONS = {"long", "short", "no-trade"}
+    VALID_ACTIONS = {"buy", "sell", "no-trade"}
     
     def __init__(self, url: str, freshness_seconds: int = 600, timeout: int = 10):
         """
@@ -51,22 +51,22 @@ class ExternalSignalClient:
         self._cache_time: Optional[float] = None
         self._fetch_lock = asyncio.Lock()
         
-    async def get_signal(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    async def get_signal(self, pair: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Fetch the latest signal from the external backend.
         Returns cached signal on network failure.
         
         Args:
-            symbol: Optional symbol filter (e.g., "BTC-USDT")
+            pair: Optional pair filter (e.g., "BTC-USDC")
             
         Returns:
-            Signal dict with keys: symbol, timestamp, action, confidence, reason, tp_pct, sl_pct
+            Signal dict with keys: pair, timestamp, action, bias, close_time, reason
             Returns None if no valid signal available
         """
         async with self._fetch_lock:
             try:
                 async with aiohttp.ClientSession() as session:
-                    params = {"symbol": symbol} if symbol else None
+                    params = {"pair": pair} if pair else None
                     async with session.get(
                         self.url,
                         params=params,
@@ -79,8 +79,8 @@ class ExternalSignalClient:
                                 self._cache_time = time.time()
                                 self.logger.info(
                                     f"Fetched external signal: {data.get('action')} "
-                                    f"for {data.get('symbol')} "
-                                    f"(confidence: {data.get('confidence', 0):.2%})"
+                                    f"for {data.get('pair')} "
+                                    f"(bias: {data.get('bias', 0):.1f}%)"
                                 )
                                 return data
                             else:
@@ -107,7 +107,7 @@ class ExternalSignalClient:
     
     def _validate_signal(self, data: Dict[str, Any]) -> bool:
         """Validate signal structure and required fields."""
-        required_fields = ["symbol", "timestamp", "action", "confidence", "tp_pct", "sl_pct"]
+        required_fields = ["pair", "timestamp", "action", "bias", "close_time"]
         
         if not isinstance(data, dict):
             return False
@@ -124,11 +124,20 @@ class ExternalSignalClient:
         
         # Validate numeric fields
         try:
-            float(data["confidence"])
-            float(data["tp_pct"])
-            float(data["sl_pct"])
+            bias = float(data["bias"])
+            if not (0 <= bias <= 100):
+                self.logger.error(f"Invalid bias value: {bias}, must be between 0 and 100")
+                return False
         except (ValueError, TypeError):
             self.logger.error("Invalid numeric values in signal")
+            return False
+        
+        # Validate timestamps
+        try:
+            datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00"))
+            datetime.fromisoformat(data["close_time"].replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            self.logger.error("Invalid timestamp format in signal")
             return False
         
         return True
@@ -174,7 +183,7 @@ class ExternalSignalClient:
         if not self._is_signal_fresh(signal):
             return False
         
-        return action in ["long", "short"]
+        return action in ["buy", "sell"]
     
     def get_cached_signal(self) -> Optional[Dict[str, Any]]:
         """Get the last cached signal without fetching."""

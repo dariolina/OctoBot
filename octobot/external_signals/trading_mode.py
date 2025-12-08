@@ -17,17 +17,20 @@
 """
 External Signal Trading Mode
 
-Trading mode that executes trades based on external AI agent swarm signals.
+Trading mode that executes spot trades based on external signals.
 Works in conjunction with ExternalSignalStrategyEvaluator.
 
 Features:
-- Executes long/short trades based on signal action
-- Applies take-profit and stop-loss levels from signal
-- Respects signal freshness and confidence thresholds
+- Executes buy trades based on signal action
+- Applies 1% stop-loss (sells if price falls below entry - 1%)
+- Automatically closes position at signal's close_time
+- Respects signal freshness and bias thresholds
 """
 
 import decimal
+import asyncio
 from typing import Optional, Dict, Any
+from datetime import datetime, timezone
 
 try:
     import octobot_trading.modes as trading_modes
@@ -44,13 +47,15 @@ import octobot_commons.logging as logging
 
 class ExternalSignalTradingMode(trading_modes.AbstractTradingMode):
     """
-    Trading mode that executes based on external signals.
+    Trading mode that executes spot trades based on external signals.
     
     This mode:
     1. Receives evaluation signals from ExternalSignalStrategyEvaluator
     2. Checks if signal is actionable (fresh, valid action)
-    3. Calculates position size and TP/SL levels
-    4. Creates market orders with stop-loss and take-profit
+    3. Calculates position size
+    4. Creates market buy orders
+    5. Sets up 1% stop-loss
+    6. Schedules automatic close at signal's close_time
     """
     
     MODE_PRODUCER_CLASSES = []
@@ -66,28 +71,27 @@ class ExternalSignalTradingMode(trading_modes.AbstractTradingMode):
         
         Available inputs:
         - position_size_percent: Percentage of portfolio to use per trade
-        - min_confidence: Minimum confidence threshold (0.0 to 1.0)
-        - enable_long: Enable long trades
-        - enable_short: Enable short trades
+        - min_bias: Minimum bias threshold (0.0 to 100.0)
+        - stop_loss_percent: Stop loss percentage (default 1.0 = 1%)
         """
         self.position_size_percent = decimal.Decimal(
             str(inputs.get("position_size_percent", 10))
         )
-        self.min_confidence = decimal.Decimal(
-            str(inputs.get("min_confidence", 0.5))
+        self.min_bias = decimal.Decimal(
+            str(inputs.get("min_bias", 50.0))
         )
-        self.enable_long = inputs.get("enable_long", True)
-        self.enable_short = inputs.get("enable_short", True)
+        self.stop_loss_percent = decimal.Decimal(
+            str(inputs.get("stop_loss_percent", 1.0))
+        )
     
     @classmethod
     def get_supported_exchange_types(cls) -> list:
         """
         Returns supported exchange types.
-        Supports both spot and futures trading.
+        Supports spot trading only.
         """
         return [
             trading_enums.ExchangeTypes.SPOT,
-            trading_enums.ExchangeTypes.FUTURE,
         ]
     
     async def create_producers(self) -> list:
@@ -109,12 +113,14 @@ class ExternalSignalTradingMode(trading_modes.AbstractTradingMode):
 
 class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsumer):
     """
-    Consumer that processes external signals and creates orders.
+    Consumer that processes external signals and creates spot trade orders.
+    Manages stop-loss and time-based exits.
     """
     
     def __init__(self, trading_mode):
         super().__init__(trading_mode)
         self.logger = logging.get_logger(self.__class__.__name__)
+        self._active_positions = {}  # Track active positions with their close tasks
     
     async def internal_callback(self, trading_mode_name: str, cryptocurrency: str,
                                symbol: str, time_frame, final_note: float,
@@ -125,7 +131,7 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
         Args:
             trading_mode_name: Name of the trading mode
             cryptocurrency: Cryptocurrency being traded
-            symbol: Trading symbol (e.g., "BTC/USDT")
+            symbol: Trading symbol (e.g., "BTC/USDC")
             time_frame: Time frame (not used by this strategy)
             final_note: Evaluation score from strategy (-1 to 1)
             state: Trading state
@@ -139,39 +145,30 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
                 return
             
             # Check if signal matches current symbol
-            signal_symbol = signal.get("symbol", "").replace("-", "/")
-            if signal_symbol != symbol:
+            signal_pair = signal.get("pair", "").replace("-", "/")
+            if signal_pair != symbol:
                 self.logger.debug(
-                    f"Signal symbol {signal_symbol} does not match {symbol}"
+                    f"Signal pair {signal_pair} does not match {symbol}"
                 )
                 return
             
-            # Check confidence threshold
-            confidence = decimal.Decimal(str(signal.get("confidence", 0)))
-            if confidence < self.trading_mode.min_confidence:
+            # Check bias threshold
+            bias = decimal.Decimal(str(signal.get("bias", 0)))
+            if bias < self.trading_mode.min_bias:
                 self.logger.info(
-                    f"Signal confidence {confidence:.2%} below threshold "
-                    f"{self.trading_mode.min_confidence:.2%}"
+                    f"Signal bias {bias:.1f}% below threshold "
+                    f"{self.trading_mode.min_bias:.1f}%"
                 )
                 return
             
-            # Determine action from final_note
+            # Determine action from signal
             action = signal.get("action")
             
-            # Check if action is enabled
-            if action == "long" and not self.trading_mode.enable_long:
-                self.logger.info("Long trades disabled, skipping signal")
-                return
-            
-            if action == "short" and not self.trading_mode.enable_short:
-                self.logger.info("Short trades disabled, skipping signal")
-                return
-            
             # Execute trade based on action
-            if action == "long":
-                await self._execute_long_trade(symbol, signal)
-            elif action == "short":
-                await self._execute_short_trade(symbol, signal)
+            if action == "buy":
+                await self._execute_buy_trade(symbol, signal)
+            elif action == "sell":
+                await self._execute_sell_trade(symbol, signal)
             else:
                 self.logger.debug(f"No action for signal: {action}")
         
@@ -192,15 +189,98 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
             self.logger.debug(f"Could not get signal from strategy: {e}")
             return None
     
-    async def _execute_long_trade(self, symbol: str, signal: Dict[str, Any]):
+    async def _schedule_position_close(self, symbol: str, close_time_str: str, quantity: decimal.Decimal):
         """
-        Execute a long trade based on signal.
+        Schedule automatic position close at the specified time.
+        Whichever comes first: stop-loss or close_time.
         
         Args:
             symbol: Trading symbol
-            signal: Signal dict containing TP/SL percentages
+            close_time_str: ISO timestamp string
+            quantity: Position quantity
         """
-        self.logger.info(f"Executing LONG trade for {symbol}")
+        try:
+            close_time = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            
+            if close_time <= now:
+                self.logger.warning(f"Close time {close_time_str} is in the past, closing immediately")
+                await self._close_position_at_market(symbol, quantity)
+                return
+            
+            wait_seconds = (close_time - now).total_seconds()
+            self.logger.info(
+                f"Scheduled position close for {symbol} at {close_time_str} "
+                f"({wait_seconds:.0f}s from now)"
+            )
+            
+            # Create and store the close task
+            task = asyncio.create_task(self._wait_and_close_position(symbol, wait_seconds, quantity))
+            self._active_positions[symbol] = task
+            
+        except (ValueError, TypeError) as e:
+            self.logger.error(f"Invalid close_time format: {close_time_str}, error: {e}")
+    
+    async def _wait_and_close_position(self, symbol: str, wait_seconds: float, quantity: decimal.Decimal):
+        """
+        Wait for the specified duration and then close the position.
+        
+        Args:
+            symbol: Trading symbol
+            wait_seconds: Seconds to wait
+            quantity: Position quantity
+        """
+        try:
+            await asyncio.sleep(wait_seconds)
+            self.logger.info(f"Close time reached for {symbol}, closing position")
+            await self._close_position_at_market(symbol, quantity)
+            
+            # Remove from active positions
+            if symbol in self._active_positions:
+                del self._active_positions[symbol]
+                
+        except asyncio.CancelledError:
+            self.logger.info(f"Position close task cancelled for {symbol}")
+        except Exception as e:
+            self.logger.exception(e, True, f"Error closing position at scheduled time: {e}")
+    
+    async def _close_position_at_market(self, symbol: str, quantity: decimal.Decimal):
+        """
+        Close position by creating a market sell order.
+        
+        Args:
+            symbol: Trading symbol
+            quantity: Quantity to sell
+        """
+        try:
+            current_price = await self._get_current_price(symbol)
+            if not current_price:
+                self.logger.error(f"Could not get current price for {symbol}")
+                return
+            
+            await self._create_order(
+                symbol=symbol,
+                order_type=trading_enums.TraderOrderType.SELL_MARKET,
+                quantity=quantity,
+                price=current_price
+            )
+            
+            self.logger.info(f"Position closed at market: {symbol} qty={quantity} price={current_price}")
+            
+        except Exception as e:
+            self.logger.exception(e, True, f"Error closing position: {e}")
+    
+    async def _execute_buy_trade(self, symbol: str, signal: Dict[str, Any]):
+        """
+        Execute a buy trade based on signal.
+        Buys the base currency (e.g., BTC) with quote currency (e.g., USDC).
+        Sets up 1% stop-loss and schedules close at close_time.
+        
+        Args:
+            symbol: Trading symbol (e.g., "BTC/USDC")
+            signal: Signal dict containing bias and close_time
+        """
+        self.logger.info(f"Executing BUY trade for {symbol}")
         
         try:
             # Get current price
@@ -215,14 +295,11 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
             )
             
             if quantity <= 0:
-                self.logger.warning(f"Insufficient funds for long trade on {symbol}")
+                self.logger.warning(f"Insufficient funds for buy trade on {symbol}")
                 return
             
-            # Calculate TP/SL prices
-            tp_pct = decimal.Decimal(str(signal.get("tp_pct", 0.01)))
-            sl_pct = decimal.Decimal(str(signal.get("sl_pct", 0.01)))
-            
-            tp_price = current_price * (decimal.Decimal("1") + tp_pct)
+            # Calculate stop-loss price (1% below entry)
+            sl_pct = self.trading_mode.stop_loss_percent / decimal.Decimal("100")
             sl_price = current_price * (decimal.Decimal("1") - sl_pct)
             
             # Create market buy order
@@ -231,27 +308,32 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
                 order_type=trading_enums.TraderOrderType.BUY_MARKET,
                 quantity=quantity,
                 price=current_price,
-                stop_loss_price=sl_price,
-                take_profit_price=tp_price
+                stop_loss_price=sl_price
             )
             
             self.logger.info(
-                f"Long order created: {symbol} qty={quantity} "
-                f"TP={tp_price} SL={sl_price}"
+                f"Buy order created: {symbol} qty={quantity} "
+                f"entry={current_price} SL={sl_price}"
             )
+            
+            # Schedule automatic close at close_time
+            close_time_str = signal.get("close_time")
+            if close_time_str:
+                await self._schedule_position_close(symbol, close_time_str, quantity)
         
         except Exception as e:
-            self.logger.exception(e, True, f"Error executing long trade: {e}")
+            self.logger.exception(e, True, f"Error executing buy trade: {e}")
     
-    async def _execute_short_trade(self, symbol: str, signal: Dict[str, Any]):
+    async def _execute_sell_trade(self, symbol: str, signal: Dict[str, Any]):
         """
-        Execute a short trade based on signal.
+        Execute a sell trade based on signal.
+        Sells existing position in the base currency.
         
         Args:
             symbol: Trading symbol
-            signal: Signal dict containing TP/SL percentages
+            signal: Signal dict
         """
-        self.logger.info(f"Executing SHORT trade for {symbol}")
+        self.logger.info(f"Executing SELL trade for {symbol}")
         
         try:
             # Get current price
@@ -260,39 +342,43 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
                 self.logger.error(f"Could not get current price for {symbol}")
                 return
             
-            # Calculate position size
-            quantity = await self._calculate_position_size(
-                symbol, current_price, trading_enums.TradeOrderSide.SELL
-            )
+            # Get available balance to sell
+            base_currency = symbol.split("/")[0]
+            portfolio = self.exchange_manager.exchange_personal_data.portfolio_manager.portfolio
+            available = portfolio.get_currency_portfolio(base_currency).available
             
-            if quantity <= 0:
-                self.logger.warning(f"Insufficient funds for short trade on {symbol}")
+            if available <= 0:
+                self.logger.warning(f"No {base_currency} balance to sell")
                 return
             
-            # Calculate TP/SL prices (inverted for short)
-            tp_pct = decimal.Decimal(str(signal.get("tp_pct", 0.01)))
-            sl_pct = decimal.Decimal(str(signal.get("sl_pct", 0.01)))
+            # Round to exchange precision
+            quantity = self._round_to_exchange_precision(symbol, available)
             
-            tp_price = current_price * (decimal.Decimal("1") - tp_pct)
-            sl_price = current_price * (decimal.Decimal("1") + sl_pct)
+            if quantity <= 0:
+                self.logger.warning(f"Insufficient {base_currency} to sell")
+                return
             
             # Create market sell order
             await self._create_order(
                 symbol=symbol,
                 order_type=trading_enums.TraderOrderType.SELL_MARKET,
                 quantity=quantity,
-                price=current_price,
-                stop_loss_price=sl_price,
-                take_profit_price=tp_price
+                price=current_price
             )
             
             self.logger.info(
-                f"Short order created: {symbol} qty={quantity} "
-                f"TP={tp_price} SL={sl_price}"
+                f"Sell order created: {symbol} qty={quantity} price={current_price}"
             )
+            
+            # Cancel any scheduled close task for this symbol
+            if symbol in self._active_positions:
+                task = self._active_positions[symbol]
+                if not task.done():
+                    task.cancel()
+                del self._active_positions[symbol]
         
         except Exception as e:
-            self.logger.exception(e, True, f"Error executing short trade: {e}")
+            self.logger.exception(e, True, f"Error executing sell trade: {e}")
     
     async def _get_current_price(self, symbol: str) -> Optional[decimal.Decimal]:
         """Get current market price for symbol."""
@@ -372,11 +458,10 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
         order_type: trading_enums.TraderOrderType,
         quantity: decimal.Decimal,
         price: decimal.Decimal,
-        stop_loss_price: Optional[decimal.Decimal] = None,
-        take_profit_price: Optional[decimal.Decimal] = None
+        stop_loss_price: Optional[decimal.Decimal] = None
     ):
         """
-        Create an order with optional stop-loss and take-profit.
+        Create an order with optional stop-loss.
         
         Args:
             symbol: Trading symbol
@@ -384,7 +469,6 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
             quantity: Order quantity
             price: Order price
             stop_loss_price: Stop-loss price
-            take_profit_price: Take-profit price
         """
         # Create main order
         order = trading_personal_data.create_order_instance(
@@ -401,11 +485,7 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
         
         # Create stop-loss order if specified
         if stop_loss_price:
-            sl_order_type = (
-                trading_enums.TraderOrderType.STOP_LOSS
-                if order_type == trading_enums.TraderOrderType.BUY_MARKET
-                else trading_enums.TraderOrderType.STOP_LOSS
-            )
+            sl_order_type = trading_enums.TraderOrderType.STOP_LOSS
             
             sl_order = trading_personal_data.create_order_instance(
                 trader=self.exchange_manager.trader,
@@ -417,25 +497,6 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
             )
             
             await self.exchange_manager.trader.create_order(sl_order)
-        
-        # Create take-profit order if specified
-        if take_profit_price:
-            tp_order_type = (
-                trading_enums.TraderOrderType.SELL_LIMIT
-                if order_type == trading_enums.TraderOrderType.BUY_MARKET
-                else trading_enums.TraderOrderType.BUY_LIMIT
-            )
-            
-            tp_order = trading_personal_data.create_order_instance(
-                trader=self.exchange_manager.trader,
-                order_type=tp_order_type,
-                symbol=symbol,
-                current_price=price,
-                quantity=quantity,
-                price=take_profit_price
-            )
-            
-            await self.exchange_manager.trader.create_order(tp_order)
 
 
 # For compatibility with tentacles system
