@@ -34,18 +34,21 @@ class Signal(BaseModel):
     action: str = Field(..., description="One of: 'buy', 'sell', 'no-trade'")
     bias: float = Field(..., ge=0.0, le=100.0, description="Signal confidence/bias as percentage (0 to 100)")
     close_time: str = Field(..., description="ISO 8601 timestamp when position should be closed (UTC)")
+    market_id: str = Field(..., description="Unique identifier for this signal to prevent duplicate trades")
     reason: Optional[str] = Field(None, description="Human-readable reason for the signal")
 
 
 # In-memory storage for demo purposes
 # Replace with your actual signal generation logic
+_now = datetime.now(timezone.utc)
 latest_signals = {
     "BTC-USDC": Signal(
         pair="BTC-USDC",
-        timestamp=datetime.now(timezone.utc).isoformat(),
+        timestamp=_now.isoformat(),
         action="buy",
         bias=75.0,
-        close_time=(datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
+        close_time=(_now + timedelta(hours=4)).isoformat(),
+        market_id=f"btc-usdc-{int(_now.timestamp())}",
         reason="AI consensus: Strong bullish momentum detected"
     )
 }
@@ -67,12 +70,14 @@ async def get_latest_signal(pair: Optional[str] = Query(None, description="Filte
         if pair in latest_signals:
             return latest_signals[pair]
         # Return a no-trade signal if pair not found
+        now = datetime.now(timezone.utc)
         return Signal(
             pair=pair,
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=now.isoformat(),
             action="no-trade",
             bias=0.0,
-            close_time=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            close_time=(now + timedelta(hours=1)).isoformat(),
+            market_id=f"{pair.lower()}-notrade-{int(now.timestamp())}",
             reason=f"No signal available for {pair}"
         )
     
@@ -90,9 +95,10 @@ async def get_latest_signal(pair: Optional[str] = Query(None, description="Filte
 
 def generate_ai_signal(pair: str) -> Signal:
     """
-    TODO: Generate a trading signal using AI Agent Swarm logic.
+    Generate a trading signal using AI Agent Swarm logic.
     
-    REPLACE THIS WITH YOUR ACTUAL AI LOGIC!
+    NOTE: This is a demo implementation. For production, your endpoint
+    at https://agents.eternax.ai/spot_signal will provide real signals.
     
     Args:
         pair: Trading pair to generate signal for
@@ -100,8 +106,8 @@ def generate_ai_signal(pair: str) -> Signal:
     Returns:
         Generated trading signal
     """
-    # Example: This is where you would call your AI agent swarm
-    # For now, this is just a placeholder that returns a demo signal
+    # Example: This is demo logic for local testing
+    # In production, signals come from https://agents.eternax.ai/spot_signal
     
     import random
     
@@ -118,15 +124,20 @@ def generate_ai_signal(pair: str) -> Signal:
         reason = f"AI consensus: {action.upper()} signal with {bias:.1f}% bias"
     
     # Set close_time to 2-6 hours from now
+    now = datetime.now(timezone.utc)
     close_hours = random.uniform(2, 6)
-    close_time = datetime.now(timezone.utc) + timedelta(hours=close_hours)
+    close_time = now + timedelta(hours=close_hours)
+    
+    # Generate unique market_id
+    market_id = f"{pair.lower().replace('-', '')}-{action}-{int(now.timestamp())}"
     
     return Signal(
         pair=pair,
-        timestamp=datetime.now(timezone.utc).isoformat(),
+        timestamp=now.isoformat(),
         action=action,
         bias=bias,
         close_time=close_time.isoformat(),
+        market_id=market_id,
         reason=reason
     )
 
@@ -156,6 +167,25 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "signals_count": len(latest_signals)
+    }
+
+
+@app.get("/error_example")
+async def error_example():
+    """
+    Example of error response format.
+    
+    When your AI system cannot generate a signal (e.g., insufficient data,
+    market conditions unclear, API failure), return this format.
+    
+    OctoBot will log the error and continue polling without attempting a trade.
+    """
+    return {
+        "pair": "BTC-USDC",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "error": "No signal available",
+        "message": "Insufficient market data for signal generation",
+        "action": "no-trade"
     }
 
 

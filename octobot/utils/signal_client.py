@@ -28,6 +28,7 @@ class ExternalSignalClient:
     """
     Client for fetching external trading signals from REST API.
     Implements caching and validation for spot trading signals.
+    Tracks market_id to ensure each signal is only traded once.
     """
     
     VALID_ACTIONS = {"buy", "sell", "no-trade"}
@@ -50,6 +51,10 @@ class ExternalSignalClient:
         self._cached_signal: Optional[Dict[str, Any]] = None
         self._cache_time: Optional[float] = None
         self._fetch_lock = asyncio.Lock()
+        
+        # Track processed market IDs to avoid duplicate trades
+        self._processed_market_ids: set = set()
+        self._last_market_id: Optional[str] = None
         
     async def get_signal(self, pair: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
@@ -74,13 +79,41 @@ class ExternalSignalClient:
                     ) as response:
                         if response.status == 200:
                             data = await response.json()
+                            
+                            # Check if response is an error
+                            if self._is_error_response(data):
+                                error_msg = data.get("error", "Unknown error")
+                                message = data.get("message", "")
+                                self.logger.warning(
+                                    f"Endpoint returned error: {error_msg}"
+                                    f"{' - ' + message if message else ''}"
+                                )
+                                # Return None to indicate no valid signal
+                                return None
+                            
                             if self._validate_signal(data):
+                                # Check if this is a new signal (different market_id)
+                                market_id = data.get("market_id")
+                                if market_id and market_id == self._last_market_id:
+                                    self.logger.debug(
+                                        f"Signal with market_id {market_id} already processed, skipping"
+                                    )
+                                    # Return cached signal but mark it as already processed
+                                    return self._cached_signal
+                                
+                                # New signal, update cache
                                 self._cached_signal = data
                                 self._cache_time = time.time()
+                                
+                                # Track this market_id
+                                if market_id:
+                                    self._last_market_id = market_id
+                                    self._processed_market_ids.add(market_id)
+                                
                                 self.logger.info(
                                     f"Fetched external signal: {data.get('action')} "
                                     f"for {data.get('pair')} "
-                                    f"(bias: {data.get('bias', 0):.1f}%)"
+                                    f"(bias: {data.get('bias', 0):.1f}%, market_id: {market_id})"
                                 )
                                 return data
                             else:
@@ -105,14 +138,35 @@ class ExternalSignalClient:
             
             return None
     
+    def _is_error_response(self, data: Dict[str, Any]) -> bool:
+        """
+        Check if the response is an error message from the endpoint.
+        
+        Error format:
+        {
+            "pair": "BTC-USDC",
+            "timestamp": "...",
+            "error": "No signal available",
+            "message": "reason",
+            "action": "no-trade"
+        }
+        
+        Args:
+            data: Response data to check
+            
+        Returns:
+            True if this is an error response
+        """
+        return "error" in data and data.get("action") == "no-trade"
+    
     def _validate_signal(self, data: Dict[str, Any]) -> bool:
         """Validate signal structure and required fields."""
-        required_fields = ["pair", "timestamp", "action", "bias", "close_time"]
-        
         if not isinstance(data, dict):
             return False
         
-        for field in required_fields:
+        # Check basic required fields
+        basic_required = ["pair", "timestamp", "action"]
+        for field in basic_required:
             if field not in data:
                 self.logger.error(f"Missing required field: {field}")
                 return False
@@ -122,23 +176,46 @@ class ExternalSignalClient:
             self.logger.error(f"Invalid action: {data['action']}, expected one of {self.VALID_ACTIONS}")
             return False
         
-        # Validate numeric fields
-        try:
-            bias = float(data["bias"])
-            if not (0 <= bias <= 100):
-                self.logger.error(f"Invalid bias value: {bias}, must be between 0 and 100")
+        # If action is "no-trade" and it's not an error response, we still need all fields
+        # If it's a buy/sell action, validate all required fields
+        if data["action"] in ["buy", "sell"]:
+            signal_required = ["bias", "close_time", "market_id"]
+            for field in signal_required:
+                if field not in data:
+                    self.logger.error(f"Missing required field for {data['action']} signal: {field}")
+                    return False
+            
+            # Validate numeric fields
+            try:
+                bias = float(data["bias"])
+                if not (0 <= bias <= 100):
+                    self.logger.error(f"Invalid bias value: {bias}, must be between 0 and 100")
+                    return False
+            except (ValueError, TypeError):
+                self.logger.error("Invalid numeric values in signal")
                 return False
-        except (ValueError, TypeError):
-            self.logger.error("Invalid numeric values in signal")
-            return False
+            
+            # Validate timestamps
+            try:
+                datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00"))
+                datetime.fromisoformat(data["close_time"].replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                self.logger.error("Invalid timestamp format in signal")
+                return False
+            
+            # Validate market_id is present and not empty
+            if not data["market_id"] or not str(data["market_id"]).strip():
+                self.logger.error("market_id field is empty")
+                return False
         
-        # Validate timestamps
-        try:
-            datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00"))
-            datetime.fromisoformat(data["close_time"].replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            self.logger.error("Invalid timestamp format in signal")
-            return False
+        elif data["action"] == "no-trade":
+            # For no-trade signals, we're more lenient
+            # Just validate timestamp if present
+            try:
+                datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                self.logger.error("Invalid timestamp format in signal")
+                return False
         
         return True
     
@@ -164,7 +241,7 @@ class ExternalSignalClient:
     
     def is_signal_actionable(self, signal: Optional[Dict[str, Any]]) -> bool:
         """
-        Check if signal is actionable (fresh and not 'no-trade').
+        Check if signal is actionable (fresh, not 'no-trade', and not already processed).
         
         Args:
             signal: Signal dict to check
@@ -183,11 +260,53 @@ class ExternalSignalClient:
         if not self._is_signal_fresh(signal):
             return False
         
+        # Check if this market_id was already processed
+        market_id = signal.get("market_id")
+        if market_id and market_id in self._processed_market_ids:
+            self.logger.debug(f"Signal with market_id {market_id} already processed")
+            return False
+        
         return action in ["buy", "sell"]
     
     def get_cached_signal(self) -> Optional[Dict[str, Any]]:
         """Get the last cached signal without fetching."""
         return self._cached_signal if self._cached_signal and self._is_signal_fresh(self._cached_signal) else None
+    
+    def mark_signal_processed(self, market_id: str) -> None:
+        """
+        Mark a signal as processed to prevent duplicate trades.
+        
+        Args:
+            market_id: The market_id of the signal that was processed
+        """
+        if market_id:
+            self._processed_market_ids.add(market_id)
+            self._last_market_id = market_id
+            self.logger.debug(f"Marked market_id {market_id} as processed")
+            
+            # Keep only the last 1000 market_ids to prevent memory growth
+            if len(self._processed_market_ids) > 1000:
+                # Remove oldest half of the set
+                ids_to_remove = list(self._processed_market_ids)[:500]
+                for old_id in ids_to_remove:
+                    self._processed_market_ids.discard(old_id)
+                self.logger.debug(f"Cleaned up old market_ids, kept {len(self._processed_market_ids)}")
+    
+    def is_signal_new(self, signal: Dict[str, Any]) -> bool:
+        """
+        Check if a signal has not been processed yet based on market_id.
+        
+        Args:
+            signal: Signal dict to check
+            
+        Returns:
+            True if signal is new (not yet processed)
+        """
+        market_id = signal.get("market_id")
+        if not market_id:
+            return True  # If no market_id, consider it new (shouldn't happen with validation)
+        
+        return market_id not in self._processed_market_ids
 
 
 def create_signal_client_from_config(config: dict) -> Optional[ExternalSignalClient]:

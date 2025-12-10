@@ -13,6 +13,7 @@ Your external signal endpoint should return JSON in the following format:
   "action": "buy",
   "bias": 75.0,
   "close_time": "2025-12-06T14:30:00Z",
+  "market_id": "btc-usdc-1733486400",
   "reason": "Strong bullish momentum detected"
 }
 ```
@@ -28,6 +29,7 @@ Your external signal endpoint should return JSON in the following format:
 | `action` | string | Trading action to take | `"buy"`, `"sell"`, `"no-trade"` |
 | `bias` | number | Confidence/bias as percentage | `0.0` to `100.0` |
 | `close_time` | string | ISO 8601 timestamp (UTC) when position should be closed | e.g., `"2025-12-06T14:30:00Z"` |
+| `market_id` | string | Unique identifier for this signal to prevent duplicate trades | e.g., `"btc-usdc-1733486400"`, `"signal-123"` |
 
 ### Optional Fields
 
@@ -78,6 +80,7 @@ Signals are filtered based on:
   "action": "buy",
   "bias": 85.5,
   "close_time": "2025-12-06T16:00:00Z",
+  "market_id": "btc-usdc-signal-001",
   "reason": "AI consensus: 85.5% bullish bias with strong momentum"
 }
 ```
@@ -96,6 +99,7 @@ Signals are filtered based on:
   "action": "buy",
   "bias": 65.0,
   "close_time": "2025-12-06T19:00:00Z",
+  "market_id": "eth-usdt-signal-002",
   "reason": "Moderate bullish signal"
 }
 ```
@@ -114,6 +118,7 @@ Signals are filtered based on:
   "action": "sell",
   "bias": 90.0,
   "close_time": "2025-12-06T12:00:00Z",
+  "market_id": "btc-usdc-exit-001",
   "reason": "Exit signal triggered"
 }
 ```
@@ -131,11 +136,56 @@ Signals are filtered based on:
   "action": "no-trade",
   "bias": 0.0,
   "close_time": "2025-12-06T14:00:00Z",
+  "market_id": "btc-usdc-notrade-001",
   "reason": "Market conditions unclear"
 }
 ```
 
 **Result**: No action taken
+
+### Example 5: Error Response
+
+```json
+{
+  "pair": "BTC-USDC",
+  "timestamp": "2025-12-06T15:00:00Z",
+  "error": "No signal available",
+  "message": "Insufficient market data for signal generation",
+  "action": "no-trade"
+}
+```
+
+**Result**: Error logged, no action taken, continues polling
+
+## Error Response Format
+
+When your endpoint cannot generate a signal (e.g., API failure, insufficient data), return an error response:
+
+```json
+{
+  "pair": "BTC-USDC",
+  "timestamp": "2025-12-06T10:30:00Z",
+  "error": "No signal available",
+  "message": "Detailed error reason",
+  "action": "no-trade"
+}
+```
+
+**Error Response Fields:**
+- `pair`: Trading pair (required)
+- `timestamp`: ISO 8601 timestamp (required)
+- `error`: Short error description (required)
+- `message`: Detailed error reason (required)
+- `action`: Must be `"no-trade"` (required)
+
+**Note:** Error responses don't need `market_id`, `bias`, or `close_time` fields.
+
+OctoBot will:
+- Log the error as WARNING
+- Not attempt any trades
+- Continue polling normally
+
+For complete error response documentation, see `ERROR_RESPONSE_FORMAT.md`.
 
 ## Configuration
 
@@ -203,11 +253,26 @@ Content-Type: application/json
 
 OctoBot validates incoming signals and will reject them if:
 
-1. Missing required fields (`pair`, `timestamp`, `action`, `bias`, `close_time`)
+1. Missing required fields (`pair`, `timestamp`, `action`, `bias`, `close_time`, `market_id`)
 2. Invalid `action` value (must be: `"buy"`, `"sell"`, or `"no-trade"`)
 3. Invalid `bias` value (must be number between 0 and 100)
 4. Invalid `timestamp` or `close_time` format (must be ISO 8601)
 5. Signal is too old (older than `freshness_seconds`)
+6. `market_id` is empty or missing
+
+## Duplicate Trade Prevention
+
+OctoBot uses the `market_id` field to prevent executing the same signal multiple times:
+
+- Each unique `market_id` is tracked after trade execution
+- If the same `market_id` is received again, the signal is skipped
+- Prevents accidental duplicate orders from the same signal
+- The last 1000 `market_id` values are kept in memory
+
+**Important:** Always provide a unique `market_id` for each distinct signal. Common patterns:
+- `"{pair}-{timestamp}"`  → `"btc-usdc-1733486400"`
+- `"{pair}-signal-{counter}"` → `"btc-usdc-signal-123"`
+- UUID or hash-based IDs
 
 ## Error Handling
 

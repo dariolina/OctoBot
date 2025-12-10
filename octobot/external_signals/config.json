@@ -1,10 +1,9 @@
 {
   "external_signal": {
     "enabled": true,
-    "url": "http://localhost:8000/latest",
+    "url": "https://agents.eternax.ai/spot_signal",
     "freshness_seconds": 600,
     "timeout": 10,
     "poll_interval_seconds": 60
   }
 }
-

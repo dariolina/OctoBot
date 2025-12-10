@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  octobot:
+    build: .
+    container_name: octobot-hyperliquid
+    volumes:
+      - ./logs:/octobot/logs
+      - ./backtesting:/octobot/backtesting
+      - ./tentacles:/octobot/tentacles
+      - ./user:/octobot/user
+      - ./octobot/external_signals:/octobot/octobot/external_signals
+    ports:
+      - "5001:5001"
+    environment:
+      - TENTACLES_URL_TAG=latest
+    restart: unless-stopped
+    networks:
+      - octobot-network
+
+networks:
+  octobot-network:
+    driver: bridge
+

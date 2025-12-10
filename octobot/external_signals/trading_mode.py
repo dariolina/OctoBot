@@ -152,6 +152,14 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
                 )
                 return
             
+            # Check if this signal was already processed (via market_id)
+            market_id = signal.get("market_id")
+            if not self._is_signal_new(signal):
+                self.logger.debug(
+                    f"Signal with market_id {market_id} already processed, skipping"
+                )
+                return
+            
             # Check bias threshold
             bias = decimal.Decimal(str(signal.get("bias", 0)))
             if bias < self.trading_mode.min_bias:
@@ -188,6 +196,50 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
         except Exception as e:
             self.logger.debug(f"Could not get signal from strategy: {e}")
             return None
+    
+    def _is_signal_new(self, signal: Dict[str, Any]) -> bool:
+        """
+        Check if signal has not been processed yet based on market_id.
+        
+        Args:
+            signal: Signal dict to check
+            
+        Returns:
+            True if signal is new (not yet processed)
+        """
+        try:
+            # Access signal client from trading mode's strategy
+            from octobot.utils import signal_client
+            config = self.trading_mode.config
+            client = signal_client.create_signal_client_from_config(config)
+            
+            if client:
+                return client.is_signal_new(signal)
+            
+            # If no client, assume signal is new
+            return True
+        except Exception as e:
+            self.logger.debug(f"Error checking if signal is new: {e}")
+            return True  # On error, assume new to avoid blocking trades
+    
+    def _mark_signal_processed(self, signal: Dict[str, Any]) -> None:
+        """
+        Mark signal as processed to prevent duplicate trades.
+        
+        Args:
+            signal: Signal dict that was processed
+        """
+        try:
+            from octobot.utils import signal_client
+            config = self.trading_mode.config
+            client = signal_client.create_signal_client_from_config(config)
+            
+            if client:
+                market_id = signal.get("market_id")
+                if market_id:
+                    client.mark_signal_processed(market_id)
+        except Exception as e:
+            self.logger.error(f"Error marking signal as processed: {e}")
     
     async def _schedule_position_close(self, symbol: str, close_time_str: str, quantity: decimal.Decimal):
         """
@@ -313,8 +365,11 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
             
             self.logger.info(
                 f"Buy order created: {symbol} qty={quantity} "
-                f"entry={current_price} SL={sl_price}"
+                f"entry={current_price} SL={sl_price} market_id={signal.get('market_id')}"
             )
+            
+            # Mark signal as processed to prevent duplicate trades
+            self._mark_signal_processed(signal)
             
             # Schedule automatic close at close_time
             close_time_str = signal.get("close_time")
@@ -367,8 +422,12 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
             )
             
             self.logger.info(
-                f"Sell order created: {symbol} qty={quantity} price={current_price}"
+                f"Sell order created: {symbol} qty={quantity} price={current_price} "
+                f"market_id={signal.get('market_id')}"
             )
+            
+            # Mark signal as processed to prevent duplicate trades
+            self._mark_signal_processed(signal)
             
             # Cancel any scheduled close task for this symbol
             if symbol in self._active_positions:
