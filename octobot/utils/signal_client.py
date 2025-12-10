@@ -197,8 +197,15 @@ class ExternalSignalClient:
             
             # Validate timestamps
             try:
-                datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00"))
-                datetime.fromisoformat(data["close_time"].replace("Z", "+00:00"))
+                timestamp = datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00"))
+                close_time = datetime.fromisoformat(data["close_time"].replace("Z", "+00:00"))
+                
+                # Ensure timestamp is before close_time
+                if timestamp >= close_time:
+                    self.logger.error(
+                        f"Invalid signal: timestamp ({timestamp}) must be before close_time ({close_time})"
+                    )
+                    return False
             except (ValueError, TypeError):
                 self.logger.error("Invalid timestamp format in signal")
                 return False
