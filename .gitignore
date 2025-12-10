@@ -116,6 +116,16 @@ backtesting/data/
 tentacles
 downloaded_temp_tentacles
 
+# Exception: Include custom external signal tentacles
+
+!tentacles/Evaluator/Strategies/external_signal_strategy_evaluator/
+!tentacles/Evaluator/Strategies/external_signal_strategy_evaluator/**
+!tentacles/Evaluator/Strategies/__init__.py
+
+!tentacles/Trading/Mode/external_signal_trading_mode/
+!tentacles/Trading/Mode/external_signal_trading_mode/**
+!tentacles/Trading/Mode/__init__.py
+
 # User config
 user/
 temp_config.json
