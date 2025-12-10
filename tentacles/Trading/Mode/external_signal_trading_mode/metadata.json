@@ -1,0 +1,7 @@
+{
+  "version": "1.0.0",
+  "origin_package": "Custom",
+  "tentacles": ["ExternalSignalTradingMode"],
+  "tentacles-requirements": []
+}
+

@@ -1,0 +1,10 @@
+{
+  "min_bias": 15.0,
+  "position_size_percent": 10.0,
+  "stop_loss_percent": 1.0,
+  "required_strategies": [
+    "ExternalSignalStrategyEvaluator"
+  ],
+  "required_strategies_min_count": 1
+}
+
