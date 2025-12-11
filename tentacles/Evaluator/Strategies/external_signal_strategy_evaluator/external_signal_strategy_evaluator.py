@@ -50,6 +50,8 @@ from typing import Optional, Dict, Any
 try:
     import octobot_evaluators.evaluators as evaluators
     import octobot_evaluators.enums as evaluator_enums
+    import octobot_evaluators.api.matrix as evaluators_api
+    import octobot_evaluators.matrix as matrix
     import octobot_commons.constants as commons_constants
     import octobot_commons.evaluators_util as evaluators_util
 except ImportError:
@@ -64,6 +66,7 @@ except ImportError:
 
 import octobot_commons.logging as logging
 import octobot.utils.signal_client as signal_client
+import octobot_trading.api as trading_api
 import octobot.commands as commands
 
 
@@ -126,6 +129,18 @@ class ExternalSignalStrategyEvaluator(evaluators.StrategyEvaluator):
             f"Polling every {self.poll_interval}s from {self.signal_client.url}"
         )
         
+        # Do an initial fetch immediately (don't wait for first poll interval)
+        try:
+            self.logger.info("Performing initial signal fetch...")
+            signal = await self.signal_client.get_signal()
+            if signal:
+                self._last_signal = signal
+                if self.signal_client.is_signal_actionable(signal):
+                    self.logger.info(f"Initial signal is actionable, processing: {signal.get('market_id')}")
+                    await self._process_signal(signal)
+        except Exception as e:
+            self.logger.warning(f"Initial signal fetch failed (will retry in polling loop): {e}")
+        
         return True
     
     async def stop(self):
@@ -141,9 +156,12 @@ class ExternalSignalStrategyEvaluator(evaluators.StrategyEvaluator):
     
     async def _signal_polling_loop(self):
         """Continuously poll for new signals at the configured interval."""
+        self.logger.info(f"Starting signal polling loop (interval: {self.poll_interval}s)")
         while True:
             try:
                 await asyncio.sleep(self.poll_interval)
+                
+                self.logger.debug(f"Polling for new signal from {self.signal_client.url}")
                 
                 # Fetch latest signal
                 signal = await self.signal_client.get_signal()
@@ -153,14 +171,25 @@ class ExternalSignalStrategyEvaluator(evaluators.StrategyEvaluator):
                     
                     # Trigger evaluation for all symbols if signal is actionable
                     if self.signal_client.is_signal_actionable(signal):
+                        self.logger.debug(f"Signal is actionable, processing: {signal.get('market_id')}")
                         await self._process_signal(signal)
+                    else:
+                        self.logger.debug(
+                            f"Signal not actionable: action={signal.get('action')}, "
+                            f"market_id={signal.get('market_id')}, "
+                            f"fresh={self.signal_client._is_signal_fresh(signal) if signal else False}"
+                        )
+                else:
+                    self.logger.debug("No signal received from endpoint")
                 
             except asyncio.CancelledError:
-                self.logger.info("Signal polling stopped")
+                self.logger.info("Signal polling stopped (cancelled)")
                 break
             except Exception as e:
                 self.logger.exception(e, True, f"Error in signal polling loop: {e}")
-                # Continue polling even after error
+                # Continue polling even after error - wait a bit before retrying
+                self.logger.warning(f"Will retry polling in {self.poll_interval}s")
+                await asyncio.sleep(self.poll_interval)
     
     async def _process_signal(self, signal: Dict[str, Any]):
         """
@@ -209,14 +238,82 @@ class ExternalSignalStrategyEvaluator(evaluators.StrategyEvaluator):
         if signal:
             self.eval_note_time_to_live = self.signal_client.freshness_seconds
             
-            # Set evaluation note
-            await self.evaluation_completed(
-                cryptocurrency=self.cryptocurrency,
-                symbol=signal.get("pair", "").replace("-", "/"),
-                time_frame=None,
-                eval_note=eval_note,
-                eval_type=evaluator_enums.EvaluatorMatrixTypes.STRATEGIES
+            # Set evaluation note (required for strategy_completed to work)
+            self.eval_note = eval_note
+            
+            # Notify trading mode that strategy evaluation is complete
+            symbol = signal.get("pair", "").replace("-", "/")
+            
+            # Use self.cryptocurrency if available (set by OctoBot based on config)
+            # This should be set automatically by OctoBot from the profile configuration
+            if hasattr(self, 'cryptocurrency') and self.cryptocurrency:
+                cryptocurrency = self.cryptocurrency
+            elif hasattr(self, 'exchange_manager') and self.exchange_manager:
+                # Try to get cryptocurrency name from exchange manager config
+                try:
+                    import octobot_trading.api as trading_api
+                    exchange_config = trading_api.get_exchange_configuration_from_exchange_id(
+                        self.exchange_manager.exchange_id
+                    )
+                    # Find cryptocurrency name from symbols_by_crypto_currencies
+                    base_code = symbol.split("/")[0]
+                    for crypto_name, pairs in exchange_config.symbols_by_crypto_currencies.items():
+                        if any(pair.startswith(base_code + "/") for pair in pairs):
+                            cryptocurrency = crypto_name
+                            break
+                    else:
+                        # Fallback: use code-to-name mapping
+                        raise KeyError("Cryptocurrency not found in config")
+                except Exception:
+                    # Fallback: map common codes to full names (OctoBot uses full names in config)
+                    code_to_name = {
+                        "BTC": "Bitcoin",
+                        "ETH": "Ethereum",
+                        "USDC": "USD Coin",
+                        "USDT": "Tether"
+                    }
+                    base_code = symbol.split("/")[0]
+                    cryptocurrency = code_to_name.get(base_code, base_code)
+            else:
+                # Final fallback: map common codes to full names
+                code_to_name = {
+                    "BTC": "Bitcoin",
+                    "ETH": "Ethereum",
+                    "USDC": "USD Coin",
+                    "USDT": "Tether"
+                }
+                base_code = symbol.split("/")[0]
+                cryptocurrency = code_to_name.get(base_code, base_code)
+            
+            self.logger.info(
+                f"Setting evaluation: cryptocurrency={cryptocurrency}, symbol={symbol}, eval_note={eval_note}"
             )
+            
+            # Set eval_note (required for strategy_completed to work)
+            self.eval_note = eval_note
+            
+            # Set evaluation in matrix first (this triggers Producer's set_final_eval)
+            # Then call strategy_completed to notify trading modes
+            if hasattr(self, 'matrix_id') and self.matrix_id:
+                try:
+                    # Set evaluation in matrix using the API
+                    evaluators_api.set_evaluator_eval(
+                        self.matrix_id,
+                        self.get_name(),
+                        evaluator_enums.EvaluatorMatrixTypes.STRATEGIES.value,
+                        self.exchange_name,
+                        cryptocurrency,
+                        symbol,
+                        None,  # time_frame
+                        eval_note
+                    )
+                    self.logger.debug(f"Set evaluation in matrix for {symbol}")
+                except Exception as e:
+                    self.logger.debug(f"Could not set evaluation in matrix: {e}")
+            
+            # Call strategy_completed which triggers trading mode callback
+            # This is the standard way to notify trading modes when strategy evaluation is complete
+            await self.strategy_completed(cryptocurrency, symbol)
     
     def get_signal_data(self) -> Optional[Dict[str, Any]]:
         """
