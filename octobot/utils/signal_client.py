@@ -105,10 +105,11 @@ class ExternalSignalClient:
                                 self._cached_signal = data
                                 self._cache_time = time.time()
                                 
-                                # Track this market_id
+                                # Track this market_id (but don't mark as processed yet - 
+                                # that happens when trade is executed)
                                 if market_id:
                                     self._last_market_id = market_id
-                                    self._processed_market_ids.add(market_id)
+                                    # Don't add to _processed_market_ids here - only when trade executes
                                 
                                 self.logger.info(
                                     f"Fetched external signal: {data.get('action')} "
@@ -316,9 +317,14 @@ class ExternalSignalClient:
         return market_id not in self._processed_market_ids
 
 
+# Singleton instance to share signal cache across all consumers
+_signal_client_instance: Optional[ExternalSignalClient] = None
+
+
 def create_signal_client_from_config(config: dict) -> Optional[ExternalSignalClient]:
     """
-    Factory function to create signal client from OctoBot config.
+    Factory function to create or get singleton signal client from OctoBot config.
+    Uses singleton pattern to ensure all components share the same signal cache.
     
     Args:
         config: OctoBot configuration dict
@@ -326,6 +332,12 @@ def create_signal_client_from_config(config: dict) -> Optional[ExternalSignalCli
     Returns:
         ExternalSignalClient instance or None if not configured
     """
+    global _signal_client_instance
+    
+    # Return existing instance if available
+    if _signal_client_instance is not None:
+        return _signal_client_instance
+    
     external_signal_config = config.get("external_signal", {})
     
     if not external_signal_config.get("enabled", False):
@@ -341,5 +353,7 @@ def create_signal_client_from_config(config: dict) -> Optional[ExternalSignalCli
     freshness_seconds = external_signal_config.get("freshness_seconds", 600)
     timeout = external_signal_config.get("timeout", 10)
     
-    return ExternalSignalClient(url, freshness_seconds, timeout)
+    # Create and store singleton instance
+    _signal_client_instance = ExternalSignalClient(url, freshness_seconds, timeout)
+    return _signal_client_instance
 
