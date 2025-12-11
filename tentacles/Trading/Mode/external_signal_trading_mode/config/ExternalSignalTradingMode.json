@@ -2,6 +2,8 @@
   "min_bias": 15.0,
   "position_size_percent": 10.0,
   "stop_loss_percent": 1.0,
+  "enable_stop_loss": true,
+  "stop_loss_delay_seconds": 5,
   "required_strategies": [
     "ExternalSignalStrategyEvaluator"
   ],
