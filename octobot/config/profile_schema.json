@@ -86,6 +86,9 @@
                 },
                 "exchange-type": {
                   "type": "string"
+                },
+                "options": {
+                  "type": "object"
                 }
               },
               "required": [

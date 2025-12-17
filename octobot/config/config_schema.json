@@ -116,6 +116,37 @@
       "items": {
         "type": "string"
       }
+    },
+    "external_signal": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable external signal trading strategy"
+        },
+        "url": {
+          "type": "string",
+          "description": "REST endpoint URL to fetch signals from"
+        },
+        "freshness_seconds": {
+          "type": "number",
+          "description": "Maximum age of signal in seconds (default: 600)",
+          "minimum": 60,
+          "maximum": 3600
+        },
+        "timeout": {
+          "type": "number",
+          "description": "HTTP request timeout in seconds (default: 10)",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "poll_interval_seconds": {
+          "type": "number",
+          "description": "Interval between signal fetches in seconds (default: 60)",
+          "minimum": 10,
+          "maximum": 600
+        }
+      }
     }
   },
   "required": [
