@@ -126,6 +126,12 @@ downloaded_temp_tentacles
 !tentacles/Trading/Mode/external_signal_trading_mode/**
 !tentacles/Trading/Mode/__init__.py
 
+# Exception: Include Hyperliquid exchange tentacle
+!tentacles/Trading/
+!tentacles/Trading/Exchange/
+!tentacles/Trading/Exchange/hyperliquid/
+!tentacles/Trading/Exchange/hyperliquid/**
+
 # User config
 user/
 temp_config.json
