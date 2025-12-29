@@ -1,6 +1,6 @@
-# External Signal Format for Spot Trading
+# External Signal Format for Spot and Perps Trading
 
-This document describes the signal format used by the External Signal Strategy for spot trading.
+This document describes the signal format used by the External Signal Strategy for both spot and perpetuals (perps) trading.
 
 ## Signal Format
 
@@ -36,6 +36,8 @@ Your external signal endpoint should return JSON in the following format:
 | Field | Type | Description |
 |-------|------|-------------|
 | `reason` | string | Human-readable explanation for the signal |
+| `leverage` | number | Suggested leverage for perps (if not using default from config) |
+| `position_type` | string | Position type for perps: "long" or "short" (if shorting enabled) |
 
 ## Trading Behavior
 
@@ -43,6 +45,7 @@ Your external signal endpoint should return JSON in the following format:
 
 When a buy signal is received:
 
+**Spot Trading:**
 1. **Entry**: OctoBot buys the base currency (e.g., BTC) using available quote currency (e.g., USDC)
 2. **Position Size**: Determined by `position_size_percent` setting (default 10% of available balance)
 3. **Stop Loss**: Automatically set at 1% below entry price (configurable via `stop_loss_percent`)
@@ -50,12 +53,29 @@ When a buy signal is received:
    - Price falls below stop-loss level (default 1%) → Sell at market
    - `close_time` is reached → Sell at market
 
+**Perps Trading:**
+1. **Entry**: Opens a long position (with leverage if configured)
+2. **Leverage & Margin**: Sets leverage and margin mode before opening position
+3. **Position Size**: Determined by `position_size_percent` and `leverage` settings
+   - Base size = `(portfolio_value × position_size_percent / 100) / price`
+   - Position size = `base_size × leverage` (margin requirement = base_size)
+4. **Stop Loss**: Automatically set at 1% below entry price using trigger orders
+5. **Exit Conditions** (whichever comes first):
+   - Price falls below stop-loss level → Close position at market
+   - `close_time` is reached → Close position at market
+
 ### Sell Signal (`action: "sell"`)
 
 When a sell signal is received:
 
+**Spot Trading:**
 1. **Exit**: OctoBot sells all available base currency at market price
 2. **Cancellation**: Any scheduled close_time tasks for this pair are cancelled
+
+**Perps Trading:**
+1. **Close Long**: If a long position exists, it is closed at market price
+2. **Open Short**: If no position exists and `enable_shorting` is true, opens a short position
+3. **Cancellation**: Any scheduled close_time tasks for this pair are cancelled
 
 ### No-Trade Signal (`action: "no-trade"`)
 
@@ -209,9 +229,15 @@ Add to your `user/config.json`:
 
 Configure the trading mode with these parameters:
 
+**Common Settings:**
 - `position_size_percent`: Percentage of portfolio to use per trade (default: 10)
 - `min_bias`: Minimum bias threshold 0-100 (default: 50.0)
 - `stop_loss_percent`: Stop loss percentage (default: 1.0 = 1%)
+
+**Perps-Specific Settings:**
+- `leverage`: Leverage multiplier (default: 1 = no leverage, 2 = 2x, etc.)
+- `margin_mode`: Margin mode - "cross" (shared margin) or "isolated" (per-position margin) (default: "cross")
+- `enable_shorting`: Allow short positions (default: false)
 
 ## API Endpoint Requirements
 
@@ -330,10 +356,24 @@ When a position is opened with a buy signal:
 
 ## Notes
 
-- Only spot trading is supported (no leverage, no short selling)
+**Spot Trading:**
+- Direct buy/sell with no leverage
+- No short selling
+- Uses available balance directly
+
+**Perps Trading:**
+- Leveraged positions (configurable via `leverage` setting)
+- Long positions: "buy" signal opens long
+- Short positions: "sell" signal can open short if `enable_shorting` is true
+- Margin modes: "cross" (shared across positions) or "isolated" (per-position)
+- Position size accounts for leverage (position_size = base_size × leverage)
+- Stop-loss uses trigger orders (Hyperliquid-specific)
+
+**General:**
 - Each signal should specify a single trading pair
 - Multiple active positions across different pairs are supported
 - The `bias` field represents your signal's confidence (0-100%)
 - Lower `min_bias` = more signals executed (more aggressive)
 - Higher `min_bias` = fewer signals executed (more conservative)
+- Exchange type (spot vs perps) is determined by exchange configuration
 

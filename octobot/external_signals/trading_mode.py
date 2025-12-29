@@ -73,6 +73,9 @@ class ExternalSignalTradingMode(trading_modes.AbstractTradingMode):
         - position_size_percent: Percentage of portfolio to use per trade
         - min_bias: Minimum bias threshold (0.0 to 100.0)
         - stop_loss_percent: Stop loss percentage (default 1.0 = 1%)
+        - leverage: Leverage multiplier for perps trading (default: 1, no leverage)
+        - margin_mode: Margin mode for perps ("cross" or "isolated", default: "cross")
+        - enable_shorting: Allow short positions for perps (default: false)
         """
         self.position_size_percent = decimal.Decimal(
             str(inputs.get("position_size_percent", 10))
@@ -83,15 +86,22 @@ class ExternalSignalTradingMode(trading_modes.AbstractTradingMode):
         self.stop_loss_percent = decimal.Decimal(
             str(inputs.get("stop_loss_percent", 1.0))
         )
+        # Perps-specific configuration
+        self.leverage = decimal.Decimal(
+            str(inputs.get("leverage", 1))
+        )
+        self.margin_mode = inputs.get("margin_mode", "cross")
+        self.enable_shorting = inputs.get("enable_shorting", False)
     
     @classmethod
     def get_supported_exchange_types(cls) -> list:
         """
         Returns supported exchange types.
-        Supports spot trading only.
+        Supports both spot and futures/perpetuals trading.
         """
         return [
             trading_enums.ExchangeTypes.SPOT,
+            trading_enums.ExchangeTypes.FUTURE,
         ]
     
     async def create_producers(self) -> list:
@@ -325,14 +335,17 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
     async def _execute_buy_trade(self, symbol: str, signal: Dict[str, Any]):
         """
         Execute a buy trade based on signal.
-        Buys the base currency (e.g., BTC) with quote currency (e.g., USDC).
-        Sets up 1% stop-loss and schedules close at close_time.
+        For spot: Buys the base currency (e.g., BTC) with quote currency (e.g., USDC).
+        For perps: Opens a long position.
+        Sets up stop-loss and schedules close at close_time.
         
         Args:
             symbol: Trading symbol (e.g., "BTC/USDC")
             signal: Signal dict containing bias and close_time
         """
-        self.logger.info(f"Executing BUY trade for {symbol}")
+        is_perps = self._is_perps_exchange()
+        action_type = "LONG position" if is_perps else "BUY"
+        self.logger.info(f"Executing {action_type} trade for {symbol}")
         
         try:
             # Get current price
@@ -341,14 +354,29 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
                 self.logger.error(f"Could not get current price for {symbol}")
                 return
             
+            # For perps: set leverage and margin mode before opening position
+            if is_perps:
+                await self._setup_perps_settings(symbol)
+            
             # Calculate position size
             quantity = await self._calculate_position_size(
                 symbol, current_price, trading_enums.TradeOrderSide.BUY
             )
             
             if quantity <= 0:
-                self.logger.warning(f"Insufficient funds for buy trade on {symbol}")
+                self.logger.warning(f"Insufficient funds for {action_type.lower()} trade on {symbol}")
                 return
+            
+            # Check for existing positions (perps only)
+            if is_perps:
+                existing_position = await self._get_existing_position(symbol)
+                if existing_position:
+                    position_size = decimal.Decimal(str(existing_position.get("size", 0)))
+                    if position_size > 0:
+                        self.logger.info(
+                            f"Existing long position found: {symbol} size={position_size}. "
+                            f"Will add to position."
+                        )
             
             # Calculate stop-loss price (1% below entry)
             sl_pct = self.trading_mode.stop_loss_percent / decimal.Decimal("100")
@@ -360,11 +388,12 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
                 order_type=trading_enums.TraderOrderType.BUY_MARKET,
                 quantity=quantity,
                 price=current_price,
-                stop_loss_price=sl_price
+                stop_loss_price=sl_price,
+                is_perps=is_perps
             )
             
             self.logger.info(
-                f"Buy order created: {symbol} qty={quantity} "
+                f"{action_type} order created: {symbol} qty={quantity} "
                 f"entry={current_price} SL={sl_price} market_id={signal.get('market_id')}"
             )
             
@@ -377,18 +406,20 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
                 await self._schedule_position_close(symbol, close_time_str, quantity)
         
         except Exception as e:
-            self.logger.exception(e, True, f"Error executing buy trade: {e}")
+            self.logger.exception(e, True, f"Error executing {action_type.lower()} trade: {e}")
     
     async def _execute_sell_trade(self, symbol: str, signal: Dict[str, Any]):
         """
         Execute a sell trade based on signal.
-        Sells existing position in the base currency.
+        For spot: Sells existing position in the base currency.
+        For perps: Closes long position or opens short position (if enabled).
         
         Args:
             symbol: Trading symbol
             signal: Signal dict
         """
-        self.logger.info(f"Executing SELL trade for {symbol}")
+        is_perps = self._is_perps_exchange()
+        self.logger.info(f"Executing SELL trade for {symbol} ({'perps' if is_perps else 'spot'})")
         
         try:
             # Get current price
@@ -397,28 +428,63 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
                 self.logger.error(f"Could not get current price for {symbol}")
                 return
             
-            # Get available balance to sell
-            base_currency = symbol.split("/")[0]
-            portfolio = self.exchange_manager.exchange_personal_data.portfolio_manager.portfolio
-            available = portfolio.get_currency_portfolio(base_currency).available
-            
-            if available <= 0:
-                self.logger.warning(f"No {base_currency} balance to sell")
-                return
-            
-            # Round to exchange precision
-            quantity = self._round_to_exchange_precision(symbol, available)
-            
-            if quantity <= 0:
-                self.logger.warning(f"Insufficient {base_currency} to sell")
-                return
+            if is_perps:
+                # For perps: check existing position
+                existing_position = await self._get_existing_position(symbol)
+                if existing_position:
+                    position_size = decimal.Decimal(str(existing_position.get("size", 0)))
+                    if position_size > 0:
+                        # Close long position
+                        self.logger.info(f"Closing long position: {symbol} size={position_size}")
+                        quantity = position_size
+                    else:
+                        # No position to close, check if shorting is enabled
+                        if self.trading_mode.enable_shorting:
+                            # Open short position
+                            self.logger.info(f"Opening short position: {symbol}")
+                            await self._setup_perps_settings(symbol)
+                            quantity = await self._calculate_position_size(
+                                symbol, current_price, trading_enums.TradeOrderSide.SELL
+                            )
+                        else:
+                            self.logger.warning(f"No position to close and shorting is disabled for {symbol}")
+                            return
+                else:
+                    # No existing position
+                    if self.trading_mode.enable_shorting:
+                        # Open short position
+                        self.logger.info(f"Opening short position: {symbol}")
+                        await self._setup_perps_settings(symbol)
+                        quantity = await self._calculate_position_size(
+                            symbol, current_price, trading_enums.TradeOrderSide.SELL
+                        )
+                    else:
+                        self.logger.warning(f"No position to close and shorting is disabled for {symbol}")
+                        return
+            else:
+                # Spot: Get available balance to sell
+                base_currency = symbol.split("/")[0]
+                portfolio = self.exchange_manager.exchange_personal_data.portfolio_manager.portfolio
+                available = portfolio.get_currency_portfolio(base_currency).available
+                
+                if available <= 0:
+                    self.logger.warning(f"No {base_currency} balance to sell")
+                    return
+                
+                # Round to exchange precision
+                quantity = self._round_to_exchange_precision(symbol, available)
+                
+                if quantity <= 0:
+                    self.logger.warning(f"Insufficient {base_currency} to sell")
+                    return
             
             # Create market sell order
             await self._create_order(
                 symbol=symbol,
                 order_type=trading_enums.TraderOrderType.SELL_MARKET,
                 quantity=quantity,
-                price=current_price
+                price=current_price,
+                is_perps=is_perps
             )
             
             self.logger.info(
@@ -455,6 +521,7 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
     ) -> decimal.Decimal:
         """
         Calculate position size based on portfolio percentage.
+        For perps: accounts for leverage in position size calculation.
         
         Args:
             symbol: Trading symbol
@@ -466,16 +533,29 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
         """
         try:
             portfolio = self.exchange_manager.exchange_personal_data.portfolio_manager.portfolio
+            is_perps = self._is_perps_exchange()
             
             # Get available balance
             if side == trading_enums.TradeOrderSide.BUY:
                 # For buy, use quote currency (e.g., USDT in BTC/USDT)
                 quote_currency = symbol.split("/")[1]
-                available = portfolio.get_currency_portfolio(quote_currency).available
+                if is_perps:
+                    # For perps, use total portfolio value (not just available)
+                    # This is because perps use margin, not direct balance
+                    portfolio_value = portfolio.get_currency_portfolio(quote_currency).total
+                    available = portfolio_value
+                else:
+                    available = portfolio.get_currency_portfolio(quote_currency).available
             else:
                 # For sell, use base currency (e.g., BTC in BTC/USDT)
                 base_currency = symbol.split("/")[0]
-                available = portfolio.get_currency_portfolio(base_currency).available
+                if is_perps:
+                    # For perps sell (short), use quote currency for margin
+                    quote_currency = symbol.split("/")[1]
+                    portfolio_value = portfolio.get_currency_portfolio(quote_currency).total
+                    available = portfolio_value
+                else:
+                    available = portfolio.get_currency_portfolio(base_currency).available
             
             # Calculate quantity based on position size percentage
             position_value = available * (self.trading_mode.position_size_percent / decimal.Decimal("100"))
@@ -483,7 +563,12 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
             if side == trading_enums.TradeOrderSide.BUY:
                 quantity = position_value / price
             else:
-                quantity = position_value
+                quantity = position_value / price  # For perps short, also divide by price
+            
+            # For perps: apply leverage to position size (but margin requirement stays the same)
+            if is_perps and self.trading_mode.leverage > 1:
+                # Position size is multiplied by leverage, but margin is position_value
+                quantity = quantity * self.trading_mode.leverage
             
             # Round to exchange precision
             quantity = self._round_to_exchange_precision(symbol, quantity)
@@ -517,10 +602,12 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
         order_type: trading_enums.TraderOrderType,
         quantity: decimal.Decimal,
         price: decimal.Decimal,
-        stop_loss_price: Optional[decimal.Decimal] = None
+        stop_loss_price: Optional[decimal.Decimal] = None,
+        is_perps: bool = False
     ):
         """
         Create an order with optional stop-loss.
+        For perps: uses trigger orders for stop-loss.
         
         Args:
             symbol: Trading symbol
@@ -528,6 +615,7 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
             quantity: Order quantity
             price: Order price
             stop_loss_price: Stop-loss price
+            is_perps: Whether this is a perps order
         """
         # Create main order
         order = trading_personal_data.create_order_instance(
@@ -544,18 +632,103 @@ class ExternalSignalTradingModeConsumer(trading_modes.AbstractTradingModeConsume
         
         # Create stop-loss order if specified
         if stop_loss_price:
-            sl_order_type = trading_enums.TraderOrderType.STOP_LOSS
+            if is_perps:
+                # For perps, use trigger order for stop-loss
+                # Hyperliquid supports trigger orders with triggerPrice
+                # We'll use the standard stop-loss order type, but the exchange adapter
+                # should handle the trigger order format
+                sl_order_type = trading_enums.TraderOrderType.STOP_LOSS
+                
+                sl_order = trading_personal_data.create_order_instance(
+                    trader=self.exchange_manager.trader,
+                    order_type=sl_order_type,
+                    symbol=symbol,
+                    current_price=price,
+                    quantity=quantity,
+                    price=stop_loss_price
+                )
+                
+                await self.exchange_manager.trader.create_order(sl_order)
+            else:
+                # Spot: standard stop-loss order
+                sl_order_type = trading_enums.TraderOrderType.STOP_LOSS
+                
+                sl_order = trading_personal_data.create_order_instance(
+                    trader=self.exchange_manager.trader,
+                    order_type=sl_order_type,
+                    symbol=symbol,
+                    current_price=price,
+                    quantity=quantity,
+                    price=stop_loss_price
+                )
+                
+                await self.exchange_manager.trader.create_order(sl_order)
+    
+    def _is_perps_exchange(self) -> bool:
+        """Check if the exchange is configured for perps/futures trading."""
+        if hasattr(self.exchange_manager, 'is_future'):
+            return self.exchange_manager.is_future
+        if hasattr(self.exchange_manager, 'exchange_type'):
+            return self.exchange_manager.exchange_type == trading_enums.ExchangeTypes.FUTURE
+        return False
+    
+    async def _setup_perps_settings(self, symbol: str):
+        """
+        Set up leverage and margin mode for perps trading.
+        
+        Args:
+            symbol: Trading symbol
+        """
+        try:
+            # Set leverage if configured
+            if self.trading_mode.leverage > 1:
+                if hasattr(self.trading_mode, 'set_leverage'):
+                    await self.trading_mode.set_leverage(
+                        symbol,
+                        None,  # side=None for one-way mode
+                        self.trading_mode.leverage
+                    )
+                elif hasattr(self.exchange_manager.exchange, 'set_leverage'):
+                    await self.exchange_manager.exchange.set_leverage(
+                        symbol,
+                        self.trading_mode.leverage
+                    )
+                self.logger.info(f"Set leverage to {self.trading_mode.leverage}x for {symbol}")
             
-            sl_order = trading_personal_data.create_order_instance(
-                trader=self.exchange_manager.trader,
-                order_type=sl_order_type,
-                symbol=symbol,
-                current_price=price,
-                quantity=quantity,
-                price=stop_loss_price
-            )
+            # Set margin mode if configured
+            if self.trading_mode.margin_mode in ["cross", "isolated"]:
+                is_isolated = self.trading_mode.margin_mode == "isolated"
+                if hasattr(self.exchange_manager.exchange, 'set_symbol_margin_type'):
+                    await self.exchange_manager.exchange.set_symbol_margin_type(
+                        symbol,
+                        is_isolated
+                    )
+                    self.logger.info(f"Set margin mode to {self.trading_mode.margin_mode} for {symbol}")
+        except Exception as e:
+            self.logger.warning(f"Could not set perps settings for {symbol}: {e}")
+    
+    async def _get_existing_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Get existing position for a symbol (perps only).
+        
+        Args:
+            symbol: Trading symbol
             
-            await self.exchange_manager.trader.create_order(sl_order)
+        Returns:
+            Position dict or None if no position
+        """
+        try:
+            if not self._is_perps_exchange():
+                return None
+            
+            positions = await self.exchange_manager.exchange.get_open_positions(symbol=symbol)
+            if positions and len(positions) > 0:
+                # Return first position (should only be one per symbol in one-way mode)
+                return positions[0]
+            return None
+        except Exception as e:
+            self.logger.debug(f"Error getting existing position for {symbol}: {e}")
+            return None
 
 
 # For compatibility with tentacles system

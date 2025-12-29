@@ -131,27 +131,37 @@ class HyperliquidConnector(exchanges.CCXTConnector):
         keys_adapter: typing.Callable[[exchanges.ExchangeCredentialsData], exchanges.ExchangeCredentialsData]=None
     ) -> tuple:
         client, is_authenticated = super()._client_factory(force_unauth, keys_adapter=self._keys_adapter)
-        # Patch fetch_balance to always use type='spot' and main account address for Hyperliquid spot markets
-        # Hyperliquid fetchBalance defaults to type='swap', but we need type='spot' for spot trading
+        # Patch fetch_balance to use correct type (spot or swap) and main account address
+        # Hyperliquid fetchBalance defaults to type='swap', but we need to match exchange type
         # Also, API wallets (agent wallets) need to use main account address for info requests
         if client and hasattr(client, 'fetch_balance'):
             original_fetch_balance = client.fetch_balance
             main_account_address = self.main_account_wallet_address
+            
+            # Determine exchange type
+            balance_type = "spot"  # default
+            if hasattr(self, 'exchange_manager') and self.exchange_manager:
+                if hasattr(self.exchange_manager, 'is_future') and self.exchange_manager.is_future:
+                    balance_type = "swap"
+                elif hasattr(self.exchange_manager, 'exchange_type'):
+                    if self.exchange_manager.exchange_type == trading_enums.ExchangeTypes.FUTURE:
+                        balance_type = "swap"
+            
             import inspect
             
             if inspect.iscoroutinefunction(original_fetch_balance):
                 # Async version
                 async def patched_fetch_balance(params=None, **kwargs):
                     """
-                    Wrapper to ensure type='spot' and main account address are passed to Hyperliquid fetchBalance.
+                    Wrapper to ensure correct type (spot/swap) and main account address are passed to Hyperliquid fetchBalance.
                     This fixes the issue where balance fetching returns empty dict {} because:
-                    1. It defaults to type='swap' instead of type='spot'
+                    1. It defaults to type='swap' instead of matching exchange type
                     2. API wallets (agent wallets) need to use main account address for info requests
                     """
                     if params is None:
                         params = {}
                     if 'type' not in params:
-                        params['type'] = 'spot'
+                        params['type'] = balance_type
                     # Use main account wallet address if available (required for API/agent wallets)
                     if main_account_address and 'user' not in params:
                         params['user'] = main_account_address
@@ -160,15 +170,15 @@ class HyperliquidConnector(exchanges.CCXTConnector):
                 # Sync version
                 def patched_fetch_balance(params=None, **kwargs):
                     """
-                    Wrapper to ensure type='spot' and main account address are passed to Hyperliquid fetchBalance.
+                    Wrapper to ensure correct type (spot/swap) and main account address are passed to Hyperliquid fetchBalance.
                     This fixes the issue where balance fetching returns empty dict {} because:
-                    1. It defaults to type='swap' instead of type='spot'
+                    1. It defaults to type='swap' instead of matching exchange type
                     2. API wallets (agent wallets) need to use main account address for info requests
                     """
                     if params is None:
                         params = {}
                     if 'type' not in params:
-                        params['type'] = 'spot'
+                        params['type'] = balance_type
                     # Use main account wallet address if available (required for API/agent wallets)
                     if main_account_address and 'user' not in params:
                         params['user'] = main_account_address
@@ -202,14 +212,30 @@ class Hyperliquid(exchanges.RestExchange):
         return HyperLiquidCCXTAdapter
 
     def get_additional_connector_config(self):
+        # Determine exchange type from exchange manager
+        exchange_type = None
+        if hasattr(self, 'exchange_manager') and self.exchange_manager:
+            if hasattr(self.exchange_manager, 'is_future') and self.exchange_manager.is_future:
+                exchange_type = "swap"
+            elif hasattr(self.exchange_manager, 'exchange_type'):
+                if self.exchange_manager.exchange_type == trading_enums.ExchangeTypes.FUTURE:
+                    exchange_type = "swap"
+        
+        # Default to spot if not determined
+        if not exchange_type:
+            exchange_type = "spot"
+        
+        # Support both spot and swap markets
+        market_types = ["spot", "swap"] if exchange_type == "swap" else ["spot"]
+        
         return {
             ccxt_constants.CCXT_OPTIONS: {
                 "fetchMarkets": {
-                    "types": ["spot"],  # only hyperliquid spot markets are supported
+                    "types": market_types,
                 },
-                "defaultType": "spot",  # default to spot for all operations including balance fetching
+                "defaultType": exchange_type,
                 "fetchBalance": {
-                    "type": "spot",  # explicitly set type to spot for balance fetching
+                    "type": exchange_type,
                 }
             }
         }

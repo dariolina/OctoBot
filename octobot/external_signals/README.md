@@ -1,6 +1,6 @@
-# External Signal Strategy for OctoBot - Spot Trading
+# External Signal Strategy for OctoBot - Spot and Perps Trading
 
-This module provides integration with external AI trading signals, allowing OctoBot to execute **spot trades** based on signals from your custom AI backend.
+This module provides integration with external AI trading signals, allowing OctoBot to execute **spot and perpetuals (perps) trades** based on signals from your custom AI backend.
 
 ## Overview
 
@@ -19,7 +19,8 @@ The External Signal Strategy consists of three main components:
 - Configurable bias (confidence) thresholds
 - Automatic 1% stop-loss order placement
 - Time-based position closure at signal's `close_time`
-- **Spot trading only** (no leverage, no shorting)
+- **Spot trading**: Direct buy/sell with no leverage
+- **Perps trading**: Leveraged long/short positions with configurable leverage and margin mode
 
 ## Installation
 
@@ -47,7 +48,10 @@ If using as a tentacle, you can configure these settings in the trading mode con
 {
   "position_size_percent": 10,
   "min_bias": 50.0,
-  "stop_loss_percent": 1.0
+  "stop_loss_percent": 1.0,
+  "leverage": 1,
+  "margin_mode": "cross",
+  "enable_shorting": false
 }
 ```
 
@@ -70,6 +74,9 @@ If using as a tentacle, you can configure these settings in the trading mode con
 | `position_size_percent` | number | 10 | Percentage of portfolio to use per trade |
 | `min_bias` | number | 50.0 | Minimum signal bias (0.0 to 100.0) |
 | `stop_loss_percent` | number | 1.0 | Stop loss percentage (e.g., 1.0 = 1%) |
+| `leverage` | number | 1 | Leverage multiplier for perps (1 = no leverage, 2 = 2x, etc.) |
+| `margin_mode` | string | "cross" | Margin mode for perps: "cross" or "isolated" |
+| `enable_shorting` | boolean | false | Allow short positions for perps trading |
 
 ## Signal Format
 
@@ -130,12 +137,14 @@ If a signal is valid and actionable:
 ### 4. Trade Execution
 
 For **buy** signals:
-- Market buy order is created
+- **Spot**: Market buy order is created
+- **Perps**: Long position is opened (with leverage if configured)
 - Stop-loss: `entry_price × (1 - stop_loss_percent/100)` (default: -1%)
 - Position automatically closes at `close_time` OR when stop-loss triggers (whichever comes first)
 
 For **sell** signals:
-- Market sell order is created for all available base currency
+- **Spot**: Market sell order is created for all available base currency
+- **Perps**: Long position is closed, or short position is opened (if `enable_shorting` is true)
 - Any scheduled close tasks are cancelled
 
 ## Usage Examples
